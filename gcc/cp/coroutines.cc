@@ -1188,6 +1188,30 @@ build_template_co_await_expr (location_t kw, tree type, tree expr, tree kind)
   return aw_expr;
 }
 
+/* For a component ref that is not a pointer type, decide if we can use
+   this directly.  */
+static bool
+usable_component_ref (tree comp_ref)
+{
+  if (TREE_CODE (comp_ref) != COMPONENT_REF
+      || TREE_SIDE_EFFECTS (comp_ref))
+    return false;
+
+  while (TREE_CODE (comp_ref) == COMPONENT_REF)
+    {
+      comp_ref = TREE_OPERAND (comp_ref, 0);
+      STRIP_NOPS (comp_ref);
+      /* x-> */
+      if (INDIRECT_REF_P (comp_ref))
+	return false;
+      /* operator-> */
+      if (TREE_CODE (comp_ref) == CALL_EXPR)
+	return false;
+      STRIP_NOPS (comp_ref);
+    }
+  gcc_checking_assert (VAR_P (comp_ref) || TREE_CODE (comp_ref) == PARM_DECL);
+  return true;
+}
 
 /*  This performs [expr.await] bullet 3.3 and validates the interface obtained.
     It is also used to build the initial and final suspend points.
@@ -1250,13 +1274,12 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
   if (o_type && !VOID_TYPE_P (o_type))
     o_type = complete_type_or_else (o_type, o);
 
-  if (!o_type)
+  if (!o_type || o_type == error_mark_node)
     return error_mark_node;
 
   if (TREE_CODE (o_type) != RECORD_TYPE)
     {
-      error_at (loc, "awaitable type %qT is not a structure",
-		o_type);
+      error_at (loc, "awaitable type %qT is not a structure", o_type);
       return error_mark_node;
     }
 
@@ -1282,20 +1305,47 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
   if (!glvalue_p (o))
     o = get_target_expr (o, tf_warning_or_error);
 
-  tree e_proxy = o;
-  if (glvalue_p (o))
+  /* We know that we need a coroutine state frame variable for the awaiter,
+     since it must persist across suspension; so where one is needed, build
+     it now.  */
+  tree e_proxy = STRIP_NOPS (o);
+  if (INDIRECT_REF_P (e_proxy))
+    e_proxy = TREE_OPERAND (e_proxy, 0);
+  o_type = TREE_TYPE (e_proxy);
+  bool is_ptr = TYPE_PTR_P (o_type);
+  if (!is_ptr
+      && (TREE_CODE (e_proxy) == PARM_DECL
+	  || usable_component_ref (e_proxy)
+	  || (VAR_P (e_proxy) && !is_local_temp (e_proxy))))
     o = NULL_TREE; /* Use the existing entity.  */
-  else /* We need to materialise it.  */
+  else /* We need a non-temp var.  */
     {
-      e_proxy = get_awaitable_var (suspend_kind, o_type);
-      o = cp_build_init_expr (loc, e_proxy, o);
-      e_proxy = convert_from_reference (e_proxy);
+      tree p_type = o_type;
+      tree o_a = o;
+      if (lvalue_p (o) && !TREE_SIDE_EFFECTS (o))
+	{
+	  if (is_ptr)
+	    p_type = TREE_TYPE (p_type);
+	  p_type = cp_build_reference_type (p_type, false);
+	  o_a = build_address (o);
+	}
+      if (INDIRECT_REF_P (o_a))
+	o_a = TREE_OPERAND (o_a, 0);
+      e_proxy = get_awaitable_var (suspend_kind, p_type);
+      o = cp_build_init_expr (loc, e_proxy, o_a);
     }
+
+  /* Build an expression for the object that will be used to call the awaitable
+     methods.  */
+  tree e_object = convert_from_reference (e_proxy);
+  if (TYPE_PTR_P (TREE_TYPE (e_object)))
+    e_object = cp_build_indirect_ref (input_location, e_object, RO_UNARY_STAR,
+				      tf_warning_or_error);
 
   /* I suppose we could check that this is contextually convertible to bool.  */
   tree awrd_func = NULL_TREE;
   tree awrd_call
-    = build_new_method_call (e_proxy, awrd_meth, NULL, NULL_TREE, LOOKUP_NORMAL,
+    = build_new_method_call (e_object, awrd_meth, NULL, NULL_TREE, LOOKUP_NORMAL,
 			     &awrd_func, tf_warning_or_error);
 
   if (!awrd_func || !awrd_call || awrd_call == error_mark_node)
@@ -1309,7 +1359,7 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
   tree h_proxy = get_coroutine_self_handle_proxy (current_function_decl);
   vec<tree, va_gc> *args = make_tree_vector_single (h_proxy);
   tree awsp_call
-    = build_new_method_call (e_proxy, awsp_meth, &args, NULL_TREE,
+    = build_new_method_call (e_object, awsp_meth, &args, NULL_TREE,
 			     LOOKUP_NORMAL, &awsp_func, tf_warning_or_error);
 
   release_tree_vector (args);
@@ -1341,7 +1391,7 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
   /* Finally, the type of e.await_resume() is the co_await's type.  */
   tree awrs_func = NULL_TREE;
   tree awrs_call
-    = build_new_method_call (e_proxy, awrs_meth, NULL, NULL_TREE, LOOKUP_NORMAL,
+    = build_new_method_call (e_object, awrs_meth, NULL, NULL_TREE, LOOKUP_NORMAL,
 			     &awrs_func, tf_warning_or_error);
 
   if (!awrs_func || !awrs_call || awrs_call == error_mark_node)
@@ -1355,7 +1405,7 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
 	return error_mark_node;
       if (coro_diagnose_throwing_fn (awrs_func))
 	return error_mark_node;
-      if (tree dummy = cxx_maybe_build_cleanup (e_proxy, tf_none))
+      if (tree dummy = cxx_maybe_build_cleanup (e_object, tf_none))
 	{
 	  if (CONVERT_EXPR_P (dummy))
 	    dummy = TREE_OPERAND (dummy, 0);
@@ -1366,7 +1416,8 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
     }
 
   /* We now have three call expressions, in terms of the promise, handle and
-     'e' proxies.  Save them in the await expression for later expansion.  */
+     'e' proxy expression.  Save them in the await expression for later
+     expansion.  */
 
   tree awaiter_calls = make_tree_vec (3);
   TREE_VEC_ELT (awaiter_calls, 0) = awrd_call; /* await_ready().  */
@@ -1378,9 +1429,6 @@ build_co_await (location_t loc, tree a, suspend_point_kind suspend_kind,
       awrs_call = TARGET_EXPR_INITIAL (awrs_call);
     }
   TREE_VEC_ELT (awaiter_calls, 2) = awrs_call; /* await_resume().  */
-
-  if (REFERENCE_REF_P (e_proxy))
-    e_proxy = TREE_OPERAND (e_proxy, 0);
 
   tree awrs_type = TREE_TYPE (TREE_TYPE (awrs_func));
   tree suspend_kind_cst = build_int_cst (integer_type_node,
