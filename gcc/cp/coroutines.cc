@@ -33,6 +33,9 @@ along with GCC; see the file COPYING3.  If not see
 #include "gcc-rich-location.h"
 #include "hash-map.h"
 #include "coroutines.h"
+#include "c-family/c-ubsan.h"
+#include "attribs.h" /* lookup_attribute */
+#include "asan.h" /* sanitize_flags_p */
 
 /* ================= Debug. ================= */
 
@@ -4535,8 +4538,17 @@ cp_coroutine_transform::wrap_original_function_body ()
       finish_expr_stmt (initial_await);
       /* Append the original function body.  */
       add_stmt (coroutine_body);
+      /* Flowing off the end of a coroutine is equivalent to calling
+	 promise.return_void () or is UB if the promise does not contain
+	 that.  Do not add an unreachable unless the user has asked for
+	 checking of such cases.  */
       if (return_void)
 	add_stmt (return_void);
+      else if (sanitize_flags_p (SANITIZE_RETURN, orig_fn_decl))
+	add_stmt (ubsan_instrument_return (fn_start));
+      else if (flag_unreachable_traps
+	       && !sanitize_flags_p (SANITIZE_UNREACHABLE, orig_fn_decl))
+	add_stmt (build_builtin_unreachable (fn_start));
       TRY_STMTS (tcb) = pop_stmt_list (TRY_STMTS (tcb));
       TRY_HANDLERS (tcb) = push_stmt_list ();
       /* Mimic what the parser does for the catch.  */
@@ -4590,8 +4602,14 @@ cp_coroutine_transform::wrap_original_function_body ()
       finish_expr_stmt (initial_await);
       /* Append the original function body.  */
       add_stmt (coroutine_body);
+      /* See comment above.  */
       if (return_void)
 	add_stmt (return_void);
+      else if (sanitize_flags_p (SANITIZE_RETURN, orig_fn_decl))
+	add_stmt (ubsan_instrument_return (fn_start));
+      else if (flag_unreachable_traps
+	       && !sanitize_flags_p (SANITIZE_UNREACHABLE, orig_fn_decl))
+	add_stmt (build_builtin_unreachable (fn_start));
     }
 
   /* co_return branches to the final_suspend label, so declare that now.  */
