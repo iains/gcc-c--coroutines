@@ -2247,6 +2247,14 @@ await_statement_expander (tree *stmt, int *do_subtree, void *d)
     }
   else if (EXPR_P (*stmt))
     {
+      /* Look for ({}) at the top level - just recurse into these.  */
+      if (TREE_CODE (*stmt) == EXPR_STMT)
+	{
+	  tree inner = EXPR_STMT_EXPR (*stmt);
+	  if (TREE_CODE (inner) == STATEMENT_LIST
+	      || TREE_CODE (inner) == BIND_EXPR)
+	    return NULL_TREE; // process contents
+	}
       process_one_statement (stmt, d);
       *do_subtree = 0; /* Done subtrees.  */
     }
@@ -3975,6 +3983,20 @@ await_statement_walker (tree *stmt, int *do_subtree, void *d)
       tree *await_ptr;
       if (!(cp_walk_tree (stmt, find_any_await, &await_ptr, &visited)))
 	return NULL_TREE; /* Nothing special to do here.  */
+
+      /* Handle statement expressions.  */
+      if (TREE_CODE (expr) == EXPR_STMT)
+	{
+	  tree inner = EXPR_STMT_EXPR (expr);
+	  if (TREE_CODE (inner) == STATEMENT_LIST
+	      || TREE_CODE (inner) == BIND_EXPR)
+	    {
+	      res = cp_walk_tree (&EXPR_STMT_EXPR (expr),
+				  await_statement_walker, d, NULL);
+	      *do_subtree = 0;
+	      return res;
+	    }
+	}
 
       visited.empty ();
       awpts->saw_awaits = 0;
